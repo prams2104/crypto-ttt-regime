@@ -5,12 +5,15 @@ Usage examples:
     # Quick sanity check with synthetic data (≈ 2 min)
     python -m src.train --synthetic --epochs 3 --batch_size 16
 
-    # Full training on real data
+    # Full training on real BTC data with explicit splits
     python -m src.train --parquet data/raw/btcusdt_1h.parquet \\
-        --epochs 50 --aux_task mask --lambda_aux 1.0
+        --train_end 2022-12-31 --val_end 2023-12-31 \\
+        --epochs 30 --aux_task mask --lambda_aux 1.0
 
     # Baseline (no aux task)
-    python -m src.train --synthetic --epochs 10 --aux_task none
+    python -m src.train --parquet data/raw/btcusdt_1h.parquet \\
+        --train_end 2022-12-31 --val_end 2023-12-31 \\
+        --epochs 30 --aux_task none --checkpoint_dir checkpoints/baseline
 """
 
 from __future__ import annotations
@@ -68,6 +71,14 @@ def parse_args() -> argparse.Namespace:
                    help="Weight on auxiliary loss.")
     p.add_argument("--weight_decay", type=float, default=5e-4)
 
+    # data splits
+    p.add_argument("--train_end", type=str, default=None,
+                   help="Train split cutoff (e.g. '2022-12-31'). Auto-computed if omitted.")
+    p.add_argument("--val_end", type=str, default=None,
+                   help="Val split cutoff (e.g. '2023-12-31'). Auto-computed if omitted.")
+    p.add_argument("--embargo_hours", type=int, default=168,
+                   help="Embargo gap between splits (default 168 = 7 days).")
+
     # misc
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
@@ -89,20 +100,26 @@ def main() -> None:
     # ── 1. Prepare dataset (if needed) ────────────────────────────────
     pt_path = Path(args.data_dir) / "dataset.pt"
     if not pt_path.exists():
+        # common kwargs for split configuration
+        split_kwargs = dict(
+            output_dir=args.data_dir,
+            seed=args.seed,
+            train_end=args.train_end,
+            val_end=args.val_end,
+            embargo_hours=args.embargo_hours,
+        )
         if args.synthetic:
             logger.info("Preparing synthetic dataset …")
             prepare_dataset(
                 synthetic=True,
                 synthetic_hours=args.synthetic_hours,
-                output_dir=args.data_dir,
-                seed=args.seed,
+                **split_kwargs,
             )
         elif args.parquet:
             logger.info("Preparing dataset from %s …", args.parquet)
             prepare_dataset(
                 parquet_path=args.parquet,
-                output_dir=args.data_dir,
-                seed=args.seed,
+                **split_kwargs,
             )
         else:
             logger.error("No data found. Use --synthetic or --parquet.")
