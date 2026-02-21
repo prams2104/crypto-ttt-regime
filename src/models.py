@@ -158,9 +158,8 @@ class MaskedPatchDecoder(nn.Module):
             nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1, bias=False),
             nn.GroupNorm(min(num_groups, 32), 32),
             nn.ReLU(inplace=True),
-            # 112×112 → 224×224
+            # 112×112 → 224×224 (no Sigmoid: avoids vanishing grads in TTT)
             nn.ConvTranspose2d(32, 3, 4, stride=2, padding=1),
-            nn.Sigmoid(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -277,29 +276,40 @@ class TTTModel(nn.Module):
 def create_temporal_mask(
     images: torch.Tensor,
     mask_ratio: float = 0.2,
+    mask_mode: str = "random_slices",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mask the *rightmost* columns of chart images (temporal masking).
-
-    The rightmost columns correspond to the most recent time steps.
-    Masking forces the aux head to predict the recent trend from context.
+    """Mask chart images for aux reconstruction.
 
     Args:
         images: (B, C, H, W) chart image batch.
-        mask_ratio: fraction of rightmost columns to zero out.
+        mask_ratio: fraction of image width to mask.
+        mask_mode: "rightmost" = extrapolation (predict future);
+                   "random_slices" = interpolation (mask middle, use context).
 
     Returns:
-        masked_images: images with rightmost columns set to 0.
+        masked_images: images with masked region zeroed.
         mask: (B, 1, H, W) binary mask (1 = masked pixel).
     """
     B, C, H, W = images.shape
-    mask_cols = max(1, int(W * mask_ratio))
-
     mask = torch.zeros(B, 1, H, W, device=images.device)
-    mask[:, :, :, W - mask_cols :] = 1.0
 
-    masked_images = images.clone()
-    masked_images[:, :, :, W - mask_cols :] = 0.0
+    if mask_mode == "rightmost":
+        mask_cols = max(1, int(W * mask_ratio))
+        mask[:, :, :, W - mask_cols :] = 1.0
+    else:  # random_slices: interpolation, avoids extrapolation trap
+        slice_width = max(1, int(W * mask_ratio / 3))
+        pad = max(10, slice_width)
+        lo, hi = pad, W - slice_width - pad
+        if hi <= lo:
+            # Fallback for small images: use rightmost
+            mask[:, :, :, W - max(1, int(W * mask_ratio)) :] = 1.0
+        else:
+            for b in range(B):
+                for _ in range(3):
+                    start = torch.randint(lo, hi, (1,), device=images.device).item()
+                    mask[b, :, :, start : start + slice_width] = 1.0
 
+    masked_images = images.clone() * (1 - mask)
     return masked_images, mask
 
 

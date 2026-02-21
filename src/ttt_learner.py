@@ -40,20 +40,29 @@ def masked_reconstruction_loss(
     reconstruction: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
+    foreground_weight: float = 50.0,
 ) -> torch.Tensor:
     """MSE reconstruction loss computed only on masked pixels.
+
+    Foreground pixels (actual chart, non-black) are weighted higher than
+    background so the aux task produces non-vanishing gradients on candlestick
+    charts where most pixels are black.
 
     Args:
         reconstruction: (B, 3, H, W) decoder output.
         target: (B, 3, H, W) original (unmasked) images.
         mask: (B, 1, H, W) binary mask (1 = masked pixel).
+        foreground_weight: weight for non-black pixels (default 50).
 
     Returns:
-        Scalar mean-squared error over masked region.
+        Scalar weighted MSE over masked region.
     """
-    diff_sq = (reconstruction - target) ** 2        # (B, 3, H, W)
-    masked_diff = diff_sq * mask                     # broadcast over C
-    n_pixels = mask.sum() * target.shape[1]          # total masked elements
+    diff_sq = (reconstruction - target) ** 2  # (B, 3, H, W)
+    # Foreground = pixels with non-zero content (candlesticks, volume bars)
+    fg = (target.mean(dim=1, keepdim=True) > 0.02).float()  # (B, 1, H, W)
+    w = fg * (foreground_weight - 1.0) + 1.0
+    masked_diff = diff_sq * mask * w
+    n_pixels = mask.sum() * target.shape[1]
     return masked_diff.sum() / (n_pixels + 1e-8)
 
 
@@ -120,6 +129,7 @@ class JointTrainer:
         lr: float = 0.1,
         lambda_aux: float = 1.0,
         mask_ratio: float = 0.2,
+        mask_mode: str = "random_slices",
         epochs: int = 50,
         weight_decay: float = 5e-4,
         class_weight: Optional[torch.Tensor] = None,
@@ -128,6 +138,7 @@ class JointTrainer:
         self.model = model
         self.lambda_aux = lambda_aux
         self.mask_ratio = mask_ratio
+        self.mask_mode = mask_mode
         self.device = device
 
         self.criterion_main = nn.CrossEntropyLoss(weight=class_weight)
@@ -148,7 +159,7 @@ class JointTrainer:
     ) -> torch.Tensor:
         """Compute auxiliary loss for the configured task."""
         if model.aux_task == "mask":
-            masked_imgs, mask = create_temporal_mask(images, self.mask_ratio)
+            masked_imgs, mask = create_temporal_mask(images, self.mask_ratio, self.mask_mode)
             recon = model.forward_aux(masked_imgs)
             return masked_reconstruction_loss(recon, images, mask)
         elif model.aux_task == "rotation":
@@ -248,22 +259,29 @@ class TTTAdaptor:
         base_lr: float = 0.001,
         ttt_steps: int = 10,
         mask_ratio: float = 0.2,
+        mask_mode: str = "random_slices",
         entropy_adaptive: bool = True,
         entropy_scale: float = 2.0,
+        ttt_optimizer: str = "sgd",
         device: torch.device = torch.device("cpu"),
     ) -> None:
         self.model = model
         self.base_lr = base_lr
         self.ttt_steps = ttt_steps
         self.mask_ratio = mask_ratio
+        self.mask_mode = mask_mode
         self.entropy_adaptive = entropy_adaptive
         self.entropy_scale = entropy_scale
         self.device = device
 
-        # TTT optimizer: SGD, zero momentum / weight-decay (per paper §3)
-        self._ttt_opt = torch.optim.SGD(
-            model.encoder.parameters(), lr=base_lr, momentum=0.0, weight_decay=0.0,
-        )
+        if ttt_optimizer.lower() == "adam":
+            self._ttt_opt = torch.optim.Adam(
+                model.encoder.parameters(), lr=base_lr, weight_decay=0.0,
+            )
+        else:
+            self._ttt_opt = torch.optim.SGD(
+                model.encoder.parameters(), lr=base_lr, momentum=0.0, weight_decay=0.0,
+            )
 
     # ── internal helpers ─────────────────────────────────────────────
 
@@ -292,7 +310,7 @@ class TTTAdaptor:
     def _ttt_step(self, images: torch.Tensor) -> float:
         """Single TTT gradient step; returns aux loss value."""
         if self.model.aux_task == "mask":
-            masked, mask = create_temporal_mask(images, self.mask_ratio)
+            masked, mask = create_temporal_mask(images, self.mask_ratio, self.mask_mode)
             recon = self.model.forward_aux(masked)
             loss = masked_reconstruction_loss(recon, images, mask)
         elif self.model.aux_task == "rotation":

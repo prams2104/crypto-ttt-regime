@@ -59,6 +59,9 @@ def parse_args() -> argparse.Namespace:
                    help="Auxiliary self-supervised task.")
     p.add_argument("--mask_ratio", type=float, default=0.2,
                    help="Fraction of chart to mask (temporal masking).")
+    p.add_argument("--mask_mode", type=str, default="random_slices",
+                   choices=["rightmost", "random_slices"],
+                   help="Masking: rightmost=extrapolation, random_slices=interpolation.")
     p.add_argument("--num_groups", type=int, default=8,
                    help="GroupNorm groups.")
 
@@ -165,6 +168,7 @@ def main() -> None:
         lr=args.lr,
         lambda_aux=args.lambda_aux if args.aux_task != "none" else 0.0,
         mask_ratio=args.mask_ratio,
+        mask_mode=args.mask_mode,
         epochs=args.epochs,
         weight_decay=args.weight_decay,
         class_weight=class_weight,

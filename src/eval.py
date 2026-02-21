@@ -57,9 +57,13 @@ def parse_args() -> argparse.Namespace:
     # TTT settings
     p.add_argument("--ttt_steps", type=int, default=10,
                    help="Gradient steps per sample for standard TTT.")
-    p.add_argument("--ttt_lr", type=float, default=0.001,
-                   help="Base test-time learning rate.")
+    p.add_argument("--ttt_lr", type=float, default=0.1,
+                   help="Base test-time learning rate (try 0.5 if TTT has no effect).")
     p.add_argument("--mask_ratio", type=float, default=0.2)
+    p.add_argument("--mask_mode", type=str, default=None,
+                   help="Override checkpoint mask_mode (rightmost | random_slices).")
+    p.add_argument("--ttt_optimizer", type=str, default="sgd", choices=["sgd", "adam"],
+                   help="TTT optimizer (adam can escape flat MSE plateaus).")
     p.add_argument("--entropy_adaptive", action="store_true",
                    help="Enable entropy-adaptive TTT learning rate.")
     p.add_argument("--entropy_scale", type=float, default=2.0)
@@ -151,13 +155,17 @@ def main() -> None:
 
     # ── 1. Baseline evaluation ───────────────────────────────────────
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
+    mask_mode = args.mask_mode or train_args.get("mask_mode", "random_slices")
+
     adaptor = TTTAdaptor(
         model=model,
         base_lr=args.ttt_lr,
         ttt_steps=args.ttt_steps,
         mask_ratio=args.mask_ratio,
+        mask_mode=mask_mode,
         entropy_adaptive=args.entropy_adaptive,
         entropy_scale=args.entropy_scale,
+        ttt_optimizer=args.ttt_optimizer,
         device=device,
     )
 
@@ -217,8 +225,10 @@ def main() -> None:
             base_lr=args.ttt_lr,
             ttt_steps=1,
             mask_ratio=args.mask_ratio,
+            mask_mode=mask_mode,
             entropy_adaptive=args.entropy_adaptive,
             entropy_scale=args.entropy_scale,
+            ttt_optimizer=args.ttt_optimizer,
             device=device,
         )
         online_out = adaptor_online.evaluate_online(online_loader)
