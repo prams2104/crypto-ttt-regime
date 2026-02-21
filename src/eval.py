@@ -64,6 +64,8 @@ def parse_args() -> argparse.Namespace:
                    help="Enable entropy-adaptive TTT learning rate.")
     p.add_argument("--entropy_scale", type=float, default=2.0)
 
+    p.add_argument("--threshold", type=float, default=0.5,
+                   help="Decision threshold for P(high_vol). Lower improves recall.")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -72,9 +74,10 @@ def compute_metrics(
     probs: np.ndarray,
     labels: np.ndarray,
     rv_values: np.ndarray | None = None,
+    threshold: float = 0.5,
 ) -> dict[str, float]:
     """Compute a full evaluation metric suite."""
-    preds = (probs[:, 1] > 0.5).astype(int) if probs.ndim == 2 else (probs > 0.5).astype(int)
+    preds = (probs[:, 1] > threshold).astype(int) if probs.ndim == 2 else (probs > threshold).astype(int)
     prob_pos = probs[:, 1] if probs.ndim == 2 else probs
 
     acc = (preds == labels).mean()
@@ -164,6 +167,7 @@ def main() -> None:
         baseline_out["probabilities"].numpy(),
         baseline_out["labels"].numpy(),
         baseline_out["rv_values"].numpy(),
+        threshold=args.threshold,
     )
 
     results = {"Baseline": baseline_metrics}
@@ -172,6 +176,7 @@ def main() -> None:
     if aux_task != "none":
         logger.info("Running standard TTT (steps=%d, lr=%.4f) …", args.ttt_steps, args.ttt_lr)
         all_preds, all_labels, all_probs, all_rv = [], [], [], []
+        all_logs: list[list[dict]] = []
 
         # Standard TTT operates per sample (batch_size=1)
         single_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
@@ -183,11 +188,21 @@ def main() -> None:
             all_labels.append(labels)
             all_probs.append(probs.cpu())
             all_rv.append(rv)
+            all_logs.append(logs)
 
         ttt_probs = torch.cat(all_probs).numpy()
         ttt_labels = torch.cat(all_labels).numpy()
         ttt_rv = torch.cat(all_rv).numpy()
-        results["TTT (standard)"] = compute_metrics(ttt_probs, ttt_labels, ttt_rv)
+        results["TTT (standard)"] = compute_metrics(
+            ttt_probs, ttt_labels, ttt_rv, threshold=args.threshold,
+        )
+
+        # TTT debug: aux loss before vs after adaptation (first 100 samples)
+        n_debug = min(100, len(all_logs))
+        if n_debug > 0:
+            init_loss = sum(all_logs[i][0]["aux_loss"] for i in range(n_debug)) / n_debug
+            final_loss = sum(all_logs[i][-1]["aux_loss"] for i in range(n_debug)) / n_debug
+            logger.info("TTT aux_loss (first %d samples): initial=%.4f → final=%.4f", n_debug, init_loss, final_loss)
 
         # ── 3. Online TTT ────────────────────────────────────────────
         logger.info("Running online TTT …")
@@ -210,6 +225,8 @@ def main() -> None:
         results["TTT (online)"] = compute_metrics(
             online_out["probabilities"].numpy(),
             online_out["labels"].numpy(),
+            online_out["rv_values"].numpy(),
+            threshold=args.threshold,
         )
 
     # ── Print comparison ─────────────────────────────────────────────

@@ -132,6 +132,14 @@ def main() -> None:
     logger.info("Dataset sizes — train: %d, val: %d, test: %d",
                 len(train_ds), len(val_ds), len(test_ds))
 
+    # Compute class weights from training set to handle imbalance
+    train_idx = dataset._splits["train"]
+    train_labels = dataset.labels[train_idx]
+    num_per_class = torch.bincount(train_labels, minlength=2).float().clamp(min=1.0)
+    # inverse frequency: weight[c] = n_samples / (n_classes * n_class_c)
+    class_weight = (train_labels.shape[0] / (2.0 * num_per_class)).to(device)
+    logger.info("Class weights (0=low_vol, 1=high_vol): %s", class_weight.tolist())
+
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
@@ -159,10 +167,12 @@ def main() -> None:
         mask_ratio=args.mask_ratio,
         epochs=args.epochs,
         weight_decay=args.weight_decay,
+        class_weight=class_weight,
         device=device,
     )
 
     # ── 5. Training loop ─────────────────────────────────────────────
+    best_val_loss = float("inf")
     best_val_acc = 0.0
     history: list[dict] = []
 
@@ -187,19 +197,22 @@ def main() -> None:
             val_loss, val_acc,
         )
         history.append({"epoch": epoch, "train": train_m, "val": val_m})
-
-        # checkpoint best
-        if val_acc >= best_val_acc:
+        if val_acc > best_val_acc:
             best_val_acc = val_acc
+
+        # checkpoint best by val loss (more stable than val_acc)
+        if val_loss <= best_val_loss:
+            best_val_loss = val_loss
             ckpt_path = ckpt_dir / "best.pt"
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": trainer.optimizer.state_dict(),
-                "val_accuracy": best_val_acc,
+                "val_loss": best_val_loss,
+                "val_accuracy": val_acc,
                 "args": vars(args),
             }, ckpt_path)
-            logger.info("  → saved best checkpoint (val_acc=%.3f)", best_val_acc)
+            logger.info("  → saved best checkpoint (val_loss=%.4f, val_acc=%.3f)", best_val_loss, val_acc)
 
     # always save latest
     final_val_acc = val_acc if len(val_ds) > 0 else train_m.get("accuracy", 0.0)
@@ -215,7 +228,7 @@ def main() -> None:
     with open(ckpt_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2, default=str)
 
-    logger.info("Training complete. Best val accuracy: %.3f", best_val_acc)
+    logger.info("Training complete. Best val_loss: %.4f, best val_acc: %.3f", best_val_loss, best_val_acc)
 
 
 if __name__ == "__main__":

@@ -102,6 +102,7 @@ class JointTrainer:
 
     Handles both ``mask`` (temporal masking) and ``rotation`` aux tasks.
     Learning-rate schedule: cosine annealing with warm restarts.
+    Supports class weights for imbalanced binary classification.
 
     Args:
         model: :class:`TTTModel` instance.
@@ -109,6 +110,7 @@ class JointTrainer:
         lambda_aux: weight on auxiliary loss.
         mask_ratio: fraction of rightmost columns to mask.
         epochs: total epochs (for LR scheduler).
+        class_weight: [weight_class_0, weight_class_1] or None for uniform.
         device: torch device.
     """
 
@@ -120,6 +122,7 @@ class JointTrainer:
         mask_ratio: float = 0.2,
         epochs: int = 50,
         weight_decay: float = 5e-4,
+        class_weight: Optional[torch.Tensor] = None,
         device: torch.device = torch.device("cpu"),
     ) -> None:
         self.model = model
@@ -127,7 +130,7 @@ class JointTrainer:
         self.mask_ratio = mask_ratio
         self.device = device
 
-        self.criterion_main = nn.CrossEntropyLoss()
+        self.criterion_main = nn.CrossEntropyLoss(weight=class_weight)
 
         self.optimizer = torch.optim.SGD(
             model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay,
@@ -323,20 +326,25 @@ class TTTAdaptor:
         saved = self._save_encoder()
         logs: list[dict] = []
 
-        self.model.train()
-        for step in range(self.ttt_steps):
-            lr = self._current_lr(images)
-            for pg in self._ttt_opt.param_groups:
-                pg["lr"] = lr
-            aux_loss = self._ttt_step(images)
-            logs.append({"step": step, "aux_loss": aux_loss, "lr": lr})
+        # Ensure encoder is trainable (critical: avoid frozen weights)
+        for p in self.model.encoder.parameters():
+            p.requires_grad_(True)
 
-        # predict with adapted encoder
+        self.model.train()
+        with torch.enable_grad():  # explicit grad context for TTT updates
+            for step in range(self.ttt_steps):
+                lr = self._current_lr(images)
+                for pg in self._ttt_opt.param_groups:
+                    pg["lr"] = lr
+                aux_loss = self._ttt_step(images)
+                logs.append({"step": step, "aux_loss": aux_loss, "lr": lr})
+
+        # Predict with adapted encoder (before restore)
         self.model.eval()
         with torch.no_grad():
-            logits = self.model.forward_main(images)
+            logits = self.model.forward_main(images).detach().clone()
 
-        # restore original encoder
+        # Restore original encoder for next sample (standard TTT resets per sample)
         self._restore_encoder(saved)
         return logits, logs
 
@@ -353,41 +361,48 @@ class TTTAdaptor:
         (per the paper §3).
 
         Returns:
-            dict with 'predictions', 'labels', 'probabilities', 'logs'.
+            dict with 'predictions', 'labels', 'probabilities', 'rv_values', 'logs'.
         """
-        all_preds, all_labels, all_probs = [], [], []
+        all_preds, all_labels, all_probs, all_rv = [], [], [], []
         logs: list[dict] = []
 
+        for p in self.model.encoder.parameters():
+            p.requires_grad_(True)
+
         self.model.train()
-        for batch in loader:
-            images = batch[0].to(self.device)
-            labels = batch[1].to(self.device)
+        with torch.enable_grad():
+            for batch in loader:
+                images = batch[0].to(self.device)
+                labels = batch[1].to(self.device)
+                rv = batch[2].to(self.device)
 
-            # entropy-adaptive LR
-            lr = self._current_lr(images)
-            for pg in self._ttt_opt.param_groups:
-                pg["lr"] = lr
+                # entropy-adaptive LR
+                lr = self._current_lr(images)
+                for pg in self._ttt_opt.param_groups:
+                    pg["lr"] = lr
 
-            # one TTT step
-            aux_loss = self._ttt_step(images)
+                # one TTT step
+                aux_loss = self._ttt_step(images)
 
-            # predict with updated model
-            self.model.eval()
-            with torch.no_grad():
-                logits = self.model.forward_main(images)
-                probs = F.softmax(logits, dim=-1)
-            self.model.train()
+                # predict with updated encoder (must use eval for deterministic output)
+                self.model.eval()
+                with torch.no_grad():
+                    logits = self.model.forward_main(images).detach()
+                    probs = F.softmax(logits, dim=-1)
+                self.model.train()
 
-            preds = logits.argmax(dim=-1)
-            all_preds.append(preds.cpu())
-            all_labels.append(labels.cpu())
-            all_probs.append(probs.cpu())
-            logs.append({"aux_loss": aux_loss, "lr": lr})
+                preds = logits.argmax(dim=-1)
+                all_preds.append(preds.cpu())
+                all_labels.append(labels.cpu())
+                all_probs.append(probs.cpu())
+                all_rv.append(rv.cpu())
+                logs.append({"aux_loss": aux_loss, "lr": lr})
 
         return {
             "predictions": torch.cat(all_preds),
             "labels": torch.cat(all_labels),
             "probabilities": torch.cat(all_probs),
+            "rv_values": torch.cat(all_rv),
             "logs": logs,
         }
 
