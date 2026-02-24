@@ -43,12 +43,24 @@ pip install -r requirements.txt
 # Sanity check: synthetic data, 3 epochs (~2 min)
 python -m src.train --synthetic --epochs 3 --batch_size 16
 
-# Evaluate with TTT
-python -m src.eval --checkpoint checkpoints/best.pt --ttt_steps 10 --entropy_adaptive
-
-# Full training on real data
-python -m src.train --parquet data/raw/btcusdt_1h.parquet --epochs 50 --aux_task mask
+# Full pipeline: data prep + train + eval (from project root)
+python -m src.train --parquet data/raw/btcusdt_1h.parquet --train_end 2022-12-31 --val_end 2023-12-31 \
+  --epochs 30 --aux_task mask --lambda_aux 1.0 --checkpoint_dir checkpoints/joint
+python -m src.eval --checkpoint checkpoints/joint/best.pt --ttt_steps 10 --ttt_lr 0.5 \
+  --ttt_optimizer adam --entropy_adaptive --threshold 0.35
 ```
+
+## Experiments (Notebooks)
+
+Run from project root or from `experiments/` (Setup cell sets paths). Requires `data/raw/btcusdt_1h.parquet`.
+
+| Notebook | Description | Outputs |
+|----------|-------------|---------|
+| **01_baseline_benchmark** | Baseline vs TTT (standard + online), mask aux; prediction-change visualization | `checkpoints/joint/best.pt`, metrics table, before/after TTT plots |
+| **02_ttt_masked_patch** | Rotation vs mask aux: train rotation model, compare metrics | `checkpoints/rotation/best.pt`, Mask vs Rotation comparison table |
+| **03_regime_stress_test** | Performance by RV quartiles (low/mid/high vol) | Metrics per regime; TTT helps most in high-vol |
+
+**Suggested order:** 01 → 02 → 03. Training cells take ~30 min each; eval ~3–5 min.
 
 ## Project Structure
 
@@ -71,6 +83,7 @@ crypto-ttt-regime/
 │   └── 03_regime_stress_test.ipynb
 ├── dashboard/
 │   └── app.py           # Streamlit visualisation (TODO)
+├── REPORT.md            # Project report (problem, results, conclusion)
 ├── requirements.txt
 └── README.md
 ```
@@ -84,6 +97,12 @@ crypto-ttt-regime/
 | ECE | Expected Calibration Error (reliability) |
 | Brier | Brier score (proper scoring rule) |
 | IC | Information Coefficient (rank correlation with realised vol) |
+
+## Report and Deliverables
+
+- **REPORT.md** — Short write-up: problem, method, results (all three experiments), conclusion.
+- **Checkpoints** — `checkpoints/joint/best.pt` (mask aux), `checkpoints/rotation/best.pt` (rotation aux). Created by running training cells in notebooks 01 and 02.
+- **Optional:** To extend to ETHUSDT, place `ethusdt_1h.parquet` in `data/raw/` and run the same train/eval commands with `--parquet data/raw/ethusdt_1h.parquet` and a separate `--checkpoint_dir` (e.g. `checkpoints/joint_eth`).
 
 ## License
 
