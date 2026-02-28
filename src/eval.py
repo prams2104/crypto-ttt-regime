@@ -57,8 +57,8 @@ def parse_args() -> argparse.Namespace:
     # TTT settings
     p.add_argument("--ttt_steps", type=int, default=10,
                    help="Gradient steps per sample for standard TTT.")
-    p.add_argument("--ttt_lr", type=float, default=0.1,
-                   help="Base test-time learning rate (try 0.5 if TTT has no effect).")
+    p.add_argument("--ttt_lr", type=float, default=0.01,
+                   help="Base test-time learning rate. Paper uses 0.001 with SGD; 0.01-0.05 recommended for Adam.")
     p.add_argument("--mask_ratio", type=float, default=0.2)
     p.add_argument("--mask_mode", type=str, default=None,
                    help="Override checkpoint mask_mode (rightmost | random_slices).")
@@ -67,6 +67,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--entropy_adaptive", action="store_true",
                    help="Enable entropy-adaptive TTT learning rate.")
     p.add_argument("--entropy_scale", type=float, default=2.0)
+    p.add_argument("--entropy_gate_threshold", type=float, default=0.3,
+                   help="Skip TTT when entropy < threshold * H_max (0.3 = 30%% of max).")
 
     p.add_argument("--threshold", type=float, default=0.5,
                    help="Decision threshold for P(high_vol). Lower improves recall.")
@@ -165,6 +167,7 @@ def main() -> None:
         mask_mode=mask_mode,
         entropy_adaptive=args.entropy_adaptive,
         entropy_scale=args.entropy_scale,
+        entropy_gate_threshold=args.entropy_gate_threshold,
         ttt_optimizer=args.ttt_optimizer,
         device=device,
     )
@@ -214,8 +217,11 @@ def main() -> None:
 
         # ── 3. Online TTT ────────────────────────────────────────────
         logger.info("Running online TTT …")
-        # Shuffle test set for online TTT (per paper §3)
-        online_loader = DataLoader(test_ds, batch_size=1, shuffle=True)
+        # Shuffle test set for online TTT (per paper §3); Fix 7: reproducible
+        online_loader = DataLoader(
+            test_ds, batch_size=1, shuffle=True,
+            generator=torch.Generator().manual_seed(args.seed),
+        )
 
         # Need a fresh model copy for online TTT (modifies encoder permanently)
         model_online = TTTModel(num_classes=2, aux_task=aux_task, num_groups=num_groups).to(device)
@@ -228,6 +234,7 @@ def main() -> None:
             mask_mode=mask_mode,
             entropy_adaptive=args.entropy_adaptive,
             entropy_scale=args.entropy_scale,
+            entropy_gate_threshold=args.entropy_gate_threshold,
             ttt_optimizer=args.ttt_optimizer,
             device=device,
         )

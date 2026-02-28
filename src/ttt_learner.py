@@ -60,6 +60,12 @@ def masked_reconstruction_loss(
     diff_sq = (reconstruction - target) ** 2  # (B, 3, H, W)
     # Foreground = pixels with non-zero content (candlesticks, volume bars)
     fg = (target.mean(dim=1, keepdim=True) > 0.02).float()  # (B, 1, H, W)
+
+    # Content-density guard: if masked region has <1% foreground, return zero loss
+    fg_ratio = (fg * mask).sum() / (mask.sum() + 1e-8)
+    if fg_ratio < 0.01:
+        return reconstruction.sum() * 0.0  # gradient-connected zero
+
     w = fg * (foreground_weight - 1.0) + 1.0
     masked_diff = diff_sq * mask * w
     n_pixels = mask.sum() * target.shape[1]
@@ -262,6 +268,7 @@ class TTTAdaptor:
         mask_mode: str = "random_slices",
         entropy_adaptive: bool = True,
         entropy_scale: float = 2.0,
+        entropy_gate_threshold: float = 0.3,
         ttt_optimizer: str = "sgd",
         device: torch.device = torch.device("cpu"),
     ) -> None:
@@ -272,6 +279,7 @@ class TTTAdaptor:
         self.mask_mode = mask_mode
         self.entropy_adaptive = entropy_adaptive
         self.entropy_scale = entropy_scale
+        self.entropy_gate_threshold = entropy_gate_threshold
         self.device = device
 
         if ttt_optimizer.lower() == "adam":
@@ -307,10 +315,23 @@ class TTTAdaptor:
             scale=self.entropy_scale,
         )
 
-    def _ttt_step(self, images: torch.Tensor) -> float:
-        """Single TTT gradient step; returns aux loss value."""
+    def _ttt_step(
+        self,
+        images: torch.Tensor,
+        precomputed_mask: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> float:
+        """Single TTT gradient step; returns aux loss value.
+
+        Args:
+            images: (B, 3, H, W) input images.
+            precomputed_mask: Optional (masked_images, mask) tuple for mask aux.
+                When provided, use it instead of generating a new mask (Fix 1).
+        """
         if self.model.aux_task == "mask":
-            masked, mask = create_temporal_mask(images, self.mask_ratio, self.mask_mode)
+            if precomputed_mask is not None:
+                masked, mask = precomputed_mask
+            else:
+                masked, mask = create_temporal_mask(images, self.mask_ratio, self.mask_mode)
             recon = self.model.forward_aux(masked)
             loss = masked_reconstruction_loss(recon, images, mask)
         elif self.model.aux_task == "rotation":
@@ -348,14 +369,39 @@ class TTTAdaptor:
         for p in self.model.encoder.parameters():
             p.requires_grad_(True)
 
+        # Fix 1: Generate mask ONCE for all TTT steps (consistent objective)
+        frozen_mask: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        if self.model.aux_task == "mask":
+            with torch.no_grad():
+                frozen_mask = create_temporal_mask(
+                    images, self.mask_ratio, self.mask_mode
+                )
+
+        # Fix 3: Confidence gate — skip TTT on easy samples
+        with torch.no_grad():
+            logits_pre = self.model.forward_main(images)
+            probs_pre = F.softmax(logits_pre, dim=-1)
+            ent = prediction_entropy(probs_pre).mean()
+
+        H_MAX = math.log(logits_pre.shape[-1])
+        if ent.item() < self.entropy_gate_threshold * H_MAX:
+            self._ttt_opt.state.clear()  # keep optimizer fresh for next sample
+            return logits_pre.detach().clone(), [
+                {"step": 0, "aux_loss": 0.0, "lr": 0.0, "skipped": True}
+            ]
+
         self.model.train()
         with torch.enable_grad():  # explicit grad context for TTT updates
             for step in range(self.ttt_steps):
                 lr = self._current_lr(images)
                 for pg in self._ttt_opt.param_groups:
                     pg["lr"] = lr
-                aux_loss = self._ttt_step(images)
+                aux_loss = self._ttt_step(images, precomputed_mask=frozen_mask)
                 logs.append({"step": step, "aux_loss": aux_loss, "lr": lr})
+
+                # Fix 4: Early stop if aux loss is increasing (overshoot)
+                if len(logs) >= 3 and aux_loss > logs[-2]["aux_loss"] * 1.05:
+                    break
 
         # Predict with adapted encoder (before restore)
         self.model.eval()
@@ -364,6 +410,8 @@ class TTTAdaptor:
 
         # Restore original encoder for next sample (standard TTT resets per sample)
         self._restore_encoder(saved)
+        # Fix 2: Clear optimizer state so next sample starts fresh
+        self._ttt_opt.state.clear()
         return logits, logs
 
     # ── online TTT ───────────────────────────────────────────────────
@@ -394,13 +442,21 @@ class TTTAdaptor:
                 labels = batch[1].to(self.device)
                 rv = batch[2].to(self.device)
 
+                # Fix 1: One mask per sample for online TTT (single step)
+                precomputed_mask = None
+                if self.model.aux_task == "mask":
+                    with torch.no_grad():
+                        precomputed_mask = create_temporal_mask(
+                            images, self.mask_ratio, self.mask_mode
+                        )
+
                 # entropy-adaptive LR
                 lr = self._current_lr(images)
                 for pg in self._ttt_opt.param_groups:
                     pg["lr"] = lr
 
                 # one TTT step
-                aux_loss = self._ttt_step(images)
+                aux_loss = self._ttt_step(images, precomputed_mask=precomputed_mask)
 
                 # predict with updated encoder (must use eval for deterministic output)
                 self.model.eval()
