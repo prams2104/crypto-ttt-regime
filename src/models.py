@@ -149,15 +149,15 @@ class MaskedPatchDecoder(nn.Module):
             # 14×14 → 28×28
             nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1, bias=False),
             nn.GroupNorm(num_groups, 128),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),  # inplace=False for MPS/autograd compatibility during TTT backward
             # 28×28 → 56×56
             nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1, bias=False),
             nn.GroupNorm(num_groups, 64),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             # 56×56 → 112×112
             nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1, bias=False),
             nn.GroupNorm(min(num_groups, 32), 32),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             # 112×112 → 224×224 (no Sigmoid: avoids vanishing grads in TTT)
             nn.ConvTranspose2d(32, 3, 4, stride=2, padding=1),
         )

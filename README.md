@@ -112,8 +112,9 @@ Test-Time Training can improve volatility regime classification under distributi
 ## 6. Reproducibility
 
 - **Data:** `data/raw/btcusdt_1h.parquet` (Binance hourly OHLCV, 2020–2026).
-- **Run order:** Experiment 01 (data prep + mask training + eval) → 02 (rotation training + eval) → 03 (regime stratification).
+- **Run order:** Experiment 01 (data prep + mask training + eval) → 02 (rotation training + eval) → 03 (regime stratification). See `experiments/01_baseline_benchmark.ipynb`, `experiments/02_ttt_masked_patch.ipynb`, and `experiments/03_regime_stress_test.ipynb`.
 - **Checkpoints:** `checkpoints/joint/best.pt` (mask aux, epoch 1), `checkpoints/rotation/best.pt` (rotation aux, epoch 4).
-- - **ETH cross-asset:** `checkpoints/joint_eth/best.pt` (mask aux, epoch 3). Use `--data_dir data/processed_eth` for eval.
+- **ETH cross-asset:** `checkpoints/joint_eth/best.pt` (mask aux, epoch 3). Use `--data_dir data/processed_eth` for eval.
 - **Key hyperparameters:** TTT lr=0.05, steps=10, Adam optimizer, entropy gate threshold=0.3, mask ratio=0.2, random_slices mode, decision threshold=0.35.
+- **Dashboard:** `streamlit run dashboard/app.py` — interactive visualization of predictions, metrics, and regime-stratified results (requires checkpoints and `data/processed/dataset.pt`). If you see a PyTorch `torch.classes` warning when running evaluation, use `STREAMLIT_SERVER_ENABLE_FILE_WATCHER=false streamlit run dashboard/app.py`.
 - **Hardware:** UCSD DataHub with CUDA GPU.

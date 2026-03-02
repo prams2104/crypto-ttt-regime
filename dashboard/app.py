@@ -8,9 +8,13 @@ Requires checkpoints from experiments 01-03 and data/processed/dataset.pt.
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
 from pathlib import Path
+
+# Prevent Streamlit's file watcher from triggering PyTorch introspection
+# (avoids "torch.classes __path__._path" warning when running evaluation)
+os.environ.setdefault("STREAMLIT_SERVER_ENABLE_FILE_WATCHER", "false")
 
 # Ensure project root is importable
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -21,6 +25,11 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
+# Patch to avoid "torch.classes __path__._path" introspection warning with Streamlit
+try:
+    torch.classes.__path__ = []
+except (AttributeError, TypeError):
+    pass
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
@@ -282,7 +291,12 @@ n_samples = n_samples_map[n_samples_option]
 # ── Load model and data ──────────────────────────────────────────────────
 
 seed_everything(42)
-device = get_device()
+# Use CPU on Apple Silicon: MPS has autograd/inplace bugs during TTT backward
+device = (
+    torch.device("cpu")
+    if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+    else get_device()
+)
 
 model, train_args, ckpt = load_model(ckpt_path, device)
 dataset = load_dataset()
