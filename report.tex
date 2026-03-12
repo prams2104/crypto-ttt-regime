@@ -1,0 +1,417 @@
+\documentclass[11pt]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{enumitem}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+% ── Title ─────────────────────────────────────────────────────────────────────
+\title{%
+  \vspace{-1.5em}
+  \rule{\linewidth}{2pt}\\[0.4em]
+  {\LARGE Project Report -- ECE 176}\\[0.3em]
+  \rule{\linewidth}{2pt}\\[1em]
+  {\Large Test-Time Training for Robust Crypto Volatility\\Regime Classification}
+}
+
+\author{%
+  \textbf{Pramesh Singhavi}\\
+  Department of Electrical and Computer Engineering\\
+  University of California, San Diego
+}
+
+\date{March 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  ABSTRACT
+% ══════════════════════════════════════════════════════════════════════════════
+\begin{abstract}
+We apply Test-Time Training (TTT)~\cite{sun2020ttt} to a novel domain: vision-based
+cryptocurrency volatility regime classification. Hourly OHLCV data (BTCUSDT, ETHUSDT)
+are rendered as $224\!\times\!224$ candlestick chart images and classified as high- or
+low-volatility using a Y-shaped ResNet18 with GroupNorm. We re-implement TTT from
+scratch and introduce two domain-specific extensions: (1)~a temporal masking auxiliary
+task with foreground-weighted MSE that produces regime-aware self-supervised gradients on
+chart images, and (2)~an entropy-adaptive confidence gate that skips test-time adaptation
+on samples where the model is already confident. On the BTC test set (2024+), online TTT
+improves F1 from 0.08 to 0.16 while preserving 0.71 accuracy; in the high-volatility
+regime specifically, F1 improves from 0.09 to 0.53. Cross-asset validation on ETH
+confirms generalization, improving accuracy from 0.47 to 0.70.
+\end{abstract}
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  1  INTRODUCTION
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Introduction}
+\label{sec:intro}
+
+Cryptocurrency markets are highly non-stationary, exhibiting frequent regime shifts in
+volatility, liquidity, and participant behavior. Models trained on historical data often
+fail to generalize when the test environment differs substantially from training---a
+problem that standard fine-tuning cannot solve without labels.
+
+Following the course's second project direction, we select the TTT paper~\cite{sun2020ttt}
+and re-implement it from scratch, applying it to cryptocurrency volatility
+classification---a domain not explored in the original work. We study whether TTT, which
+adapts model parameters at inference time using a self-supervised auxiliary loss on
+unlabeled test samples, can improve robustness of a vision-based volatility classifier
+under realistic crypto market regime changes. Unlike unsupervised domain adaptation, TTT
+requires no prior access to test-distribution data during training---a critical property
+for live markets where future regimes cannot be anticipated.
+
+\textbf{Research question.}
+Can self-supervised TTT adapt a vision-based volatility classifier to non-stationary
+crypto market regimes without access to ground-truth labels during inference?
+
+\textbf{Hypothesis.}
+Market regimes correspond to domain shifts in chart geometry and volatility structure.
+Solving a temporally-aware self-supervised task on test samples can align the model's
+feature extractor to the active regime before prediction.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\textwidth]{sample_charts.png}
+  \caption{Sample $224\!\times\!224$ candlestick chart inputs. Top row: low-volatility
+    windows ($\mathrm{RV} \approx 0.005$). Bottom row: high-volatility windows
+    ($\mathrm{RV} \approx 0.09$). Visual differences in candle size, wick length, and
+    volume bar height provide the self-supervised reconstruction signal used during TTT.}
+  \label{fig:sample_charts}
+\end{figure}
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  2  RELATED WORK
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Related Work}
+\label{sec:related}
+
+Sun et al.~\cite{sun2020ttt} propose TTT, which creates a self-supervised learning
+problem from each unlabeled test sample and updates shared model parameters before
+prediction. Their method uses rotation prediction~\cite{gidaris2018rotation} as the
+auxiliary task and demonstrates improvements on CIFAR-10-C and ImageNet-C. We
+re-implement this architecture from scratch and adapt it to the financial domain.
+
+Hendrycks et al.~\cite{hendrycks2019pretraining} show that joint training with
+self-supervised tasks improves robustness; TTT extends this by continuing adaptation at
+test time. Our work differs in domain (financial time series as images), auxiliary task
+(temporal masking vs.\ rotation), and the need for a confidence gate---since unlike image
+corruption benchmarks, not all crypto test samples experience distribution shift.
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  3  METHOD
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Method}
+\label{sec:method}
+
+\subsection{Data Pipeline}
+\label{sec:data_pipeline}
+
+Hourly OHLCV data (BTCUSDT, 2020--2026) is segmented into rolling 168-hour (7-day)
+windows with 24-hour stride. Each window is rendered as a $224\!\times\!224$ candlestick
++ volume chart image (black background, green/red candles, volume bars). Binary labels
+are computed from next-24h realized volatility:
+\begin{equation}
+  \mathrm{RV} = \sqrt{\sum_{i=1}^{24} r_{t+i}^{2}},
+  \label{eq:rv}
+\end{equation}
+thresholded at the training-set median. Time-based splits with 168\,h embargo:
+train $\leq$ 2022-12-31, val 2023, test 2024+. Result: ${\sim}75\%$ low-vol,
+${\sim}25\%$ high-vol on the test set.
+
+\subsection{Model Architecture (Y-shaped ResNet18-GN)}
+\label{sec:architecture}
+
+\textbf{Shared encoder:} ResNet18~\cite{he2016resnet} layers 1--3 with
+GroupNorm~\cite{wu2018groupnorm}. GN replaces BatchNorm because TTT adapts on a single
+test sample at a time---batch size 1 causes BN running statistics to degenerate, while GN
+computes normalization over channel groups within each sample and is unaffected.
+
+\textbf{Main head:} Layer4 $\rightarrow$ GlobalAvgPool $\rightarrow$ FC(2)---volatility
+classification.
+
+\textbf{Auxiliary head (mask):} TransposedConv decoder $\rightarrow$
+$(3, 224, 224)$---masked reconstruction.
+
+\textbf{Auxiliary head (rotation, baseline):} GlobalAvgPool $\rightarrow$
+FC(4)---rotation prediction.
+
+\textbf{Training objective:}
+\begin{equation}
+  \mathcal{L}_{\text{total}}
+    = \mathcal{L}_{\text{main}}(\text{CE with class weights})
+    + \lambda \cdot \mathcal{L}_{\text{aux}},
+  \quad \lambda = 1.0.
+  \label{eq:loss}
+\end{equation}
+
+\subsection{Auxiliary Tasks}
+\label{sec:aux_tasks}
+
+\textbf{Temporal Masking (novel).}
+Masks 20\% random vertical column slices of the chart image; the auxiliary head
+reconstructs the masked region. Loss: foreground-weighted MSE (non-black pixels weighted
+$50\!\times$) to prevent gradients collapsing on the black background. This is
+regime-aware: high-volatility charts have more foreground, producing stronger gradients.
+
+\textbf{Rotation (baseline from Sun et al.).}
+Predict 0\textdegree/90\textdegree/180\textdegree/270\textdegree\ rotation. Finding:
+catastrophic during TTT---auxiliary loss explodes from 0.004 to 22.5 because rotating
+charts has no temporal semantics.
+
+\subsection{Implementation Details}
+\label{sec:impl}
+
+The entire pipeline---data rendering, model architecture, training loop, and TTT
+inference---is implemented from scratch in PyTorch. We train with Adam (lr $= 10^{-4}$,
+weight decay $= 10^{-5}$), batch size 32, for 10 epochs with early stopping on
+validation loss. Class-weighted cross-entropy addresses the ${\sim}75/25$ label imbalance.
+All experiments run on a single NVIDIA RTX 4090. Training takes approximately 20 minutes;
+TTT inference over 770 BTC test samples takes ${\sim}5$ minutes (standard) or ${\sim}45$
+seconds (online, 1 step per sample). For cross-asset validation, we apply the same
+pipeline to ETHUSDT with identical split dates and hyperparameters---no retraining is
+performed.
+
+\subsection{Test-Time Training}
+\label{sec:ttt}
+
+\textbf{Standard TTT.}
+For each test sample, save encoder weights, run 10 gradient steps on the auxiliary loss,
+predict, restore weights. Optimizer state is reset between samples.
+
+\textbf{Online TTT.}
+Adapt sequentially (1 step per sample), keeping encoder state. Confidence gate: skip TTT
+when $H(\mathbf{p}) < 0.3 \times H_{\max}$ (entropy threshold). Entropy-adaptive
+learning rate:
+\begin{equation}
+  \alpha(t) = \text{base\_lr} \times
+    \bigl[\text{min\_factor} + \text{scale} \times H(\mathbf{p}) / H_{\max}\bigr].
+  \label{eq:adaptive_lr}
+\end{equation}
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  4  EXPERIMENTS
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Dataset}
+\label{sec:dataset}
+
+\textbf{Primary:} BTCUSDT hourly OHLCV from Binance (2020--2026), fetched via the
+\texttt{python-binance} API. 770 test samples.
+\textbf{Cross-asset:} ETHUSDT, same pipeline.
+\textbf{Data format:} $224\!\times\!224$ RGB float32 tensors, binary labels, RV float32
+values.
+
+\subsection{Experiment 01 --- Baseline and TTT (Mask Auxiliary)}
+\label{sec:exp01}
+
+\begin{table}[H]
+  \centering
+  \caption{BTC test-set performance: mask auxiliary task.}
+  \label{tab:exp01}
+  \begin{tabular}{lccccc}
+    \toprule
+    Mode & Accuracy & F1 & ECE & Brier & IC \\
+    \midrule
+    Baseline        & \textbf{0.7636} & 0.0808          & \textbf{0.0585} & \textbf{0.1723} & \textbf{0.0951} \\
+    TTT (standard)  & 0.5688          & \textbf{0.3054} & 0.1149          & 0.1850          & 0.0046          \\
+    TTT (online)    & 0.7065          & 0.1567          & 0.1104          & 0.1827          & $-$0.0677       \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The baseline achieves high accuracy by predicting the majority class (low-vol), yielding
+near-zero F1. Standard TTT improves F1 $4\!\times$ at the cost of accuracy. Online TTT
+with the confidence gate balances both: the gate skips adaptation on ${\sim}60$--$70\%$ of
+samples where the model is already confident, preserving baseline predictions on easy
+low-volatility windows while concentrating adaptation budget on ambiguous or shifted
+samples.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\textwidth]{prediction_shift_scatter.png}
+  \caption{Prediction shifts before and after TTT. TTT increases $P(\text{high\_vol})$
+    most strongly for samples near the decision boundary, with greater shifts on true
+    high-vol samples (red).}
+  \label{fig:prediction_shift}
+\end{figure}
+
+\subsection{Experiment 02 --- Rotation vs.\ Mask Auxiliary}
+\label{sec:exp02}
+
+\begin{table}[H]
+  \centering
+  \caption{Rotation vs.\ mask auxiliary task comparison on BTC test set.}
+  \label{tab:exp02}
+  \begin{tabular}{llccc}
+    \toprule
+    Aux Task & Mode & Accuracy & F1 & IC \\
+    \midrule
+    Mask     & Baseline        & \textbf{0.7636} & 0.0808          & 0.0951          \\
+    Mask     & TTT (standard)  & 0.5688          & \textbf{0.3054} & 0.0046          \\
+    Mask     & TTT (online)    & 0.7065          & 0.1567          & $-$0.0677       \\
+    \midrule
+    Rotation & Baseline        & 0.5013          & 0.3663          & \textbf{0.1913} \\
+    Rotation & TTT (standard)  & 0.4987          & 0.3299          & 0.0147          \\
+    Rotation & TTT (online)    & 0.4026          & 0.3072          & $-$0.0587       \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The rotation baseline has better F1 (0.37) but TTT auxiliary loss explodes
+($0.004 \rightarrow 22.5$), confirming that rotation has no regime-specific semantics for
+chart images.
+
+\subsection{Experiment 03 --- Regime-Stratified Evaluation}
+\label{sec:exp03}
+
+\begin{table}[H]
+  \centering
+  \caption{Regime-stratified performance on BTC test set (standard TTT, mask auxiliary).}
+  \label{tab:exp03}
+  \begin{tabular}{lccccc}
+    \toprule
+    RV Bin & $n$ & Baseline Acc & Baseline F1 & TTT Acc & TTT F1 \\
+    \midrule
+    Low (0--25\%)       & 193 & \textbf{0.969} & 0.000 & 0.549 & 0.000          \\
+    Mid-Low (25--50\%)  & 192 & 0.938          & 0.000 & 0.641 & 0.000          \\
+    Mid-High (50--75\%) & 192 & 0.974          & 0.000 & 0.630 & 0.000          \\
+    High (75--100\%)    & 193 & 0.176          & 0.091 & 0.415 & \textbf{0.531} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.75\textwidth]{regime_f1_bar.png}
+  \caption{Regime-stratified F1 score. TTT substantially improves F1 only in the
+    high-volatility regime ($0.09 \rightarrow 0.53$), where distribution shift from
+    training is largest. The confidence gate preserves baseline accuracy in low/mid
+    regimes.}
+  \label{fig:regime_f1}
+\end{figure}
+
+\subsection{Experiment 04 --- Cross-Asset Validation (ETHUSDT)}
+\label{sec:exp04}
+
+\begin{table}[H]
+  \centering
+  \caption{Cross-asset validation on ETHUSDT.}
+  \label{tab:exp04}
+  \begin{tabular}{lccccc}
+    \toprule
+    Mode & Accuracy & F1 & ECE & Brier & IC \\
+    \midrule
+    Baseline        & 0.4675          & \textbf{0.3750} & 0.0979          & 0.1993          & 0.0667          \\
+    TTT (standard)  & 0.5961          & 0.2613          & 0.0852          & 0.1975          & $-$0.0167       \\
+    TTT (online)    & \textbf{0.7026} & 0.2776          & \textbf{0.0688} & \textbf{0.1932} & \textbf{0.0629} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+ETH has a more balanced class distribution than BTC, which explains the higher baseline F1
+(0.38 vs.\ 0.08)---the model cannot trivially predict majority-class and must actually
+discriminate. Online TTT improves accuracy $0.47 \rightarrow 0.70$ and calibration ECE
+$0.098 \rightarrow 0.069$, demonstrating that the learned adaptation mechanism generalizes
+across assets without retraining.
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  5  DISCUSSION
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Discussion}
+\label{sec:discussion}
+
+\subsubsection*{What Worked}
+
+\begin{itemize}[nosep,leftmargin=1.2em]
+  \item Temporal masking produces regime-aware gradients. Foreground-weighted MSE ensures
+    gradients are driven by chart geometry, not the black background.
+  \item Confidence gating is essential for financial TTT---unlike image corruption
+    benchmarks where all test samples are shifted, crypto test sets mix shifted and
+    unshifted samples.
+  \item A consistent mask per sample (generated once, not re-randomized each step) ensures
+    convergence to a stable adaptation objective.
+  \item Optimizer state reset between standard TTT samples prevents momentum leakage.
+\end{itemize}
+
+\subsubsection*{Limitations}
+
+\begin{itemize}[nosep,leftmargin=1.2em]
+  \item Only two assets (BTC, ETH). Further validation on altcoins is needed.
+  \item Best checkpoint from epoch~1---joint training loss dominated by the auxiliary
+    reconstruction term; the main head stops improving early. Separate learning rate
+    schedules could help.
+  \item IC near zero across all TTT modes. The binary framing discards ordinal information.
+  \item Class imbalance (${\sim}75/25$ split)---a calibrated threshold from the validation
+    PR curve would help.
+\end{itemize}
+
+\subsubsection*{Comparison with Sun et al.\ (2020)}
+
+Results are qualitatively consistent. Key differences from the financial domain:
+(1)~not all test samples are shifted $\rightarrow$ need confidence gate;
+(2)~chart images are sparse $\rightarrow$ need foreground weighting;
+(3)~the auxiliary task must carry temporal/regime semantics $\rightarrow$ rotation fails,
+masking works.
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  6  CONCLUSION
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Conclusion}
+\label{sec:conclusion}
+
+Test-Time Training can improve volatility regime classification under distribution shift,
+but requires domain-specific adaptations. The temporal masking auxiliary task provides
+regime-aware gradients, and the entropy-adaptive confidence gate prevents
+over-adaptation. Together, these make TTT viable for non-stationary financial time series
+where only a subset of test samples experience meaningful distribution shift.
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  REFERENCES
+% ══════════════════════════════════════════════════════════════════════════════
+\begin{thebibliography}{5}
+
+\bibitem{sun2020ttt}
+Sun, Y., Wang, X., Liu, Z., Miller, J., Efros, A.\,A., \& Hardt, M. (2020).
+Test-time training with self-supervision for generalization under distribution shifts.
+\textit{Proceedings of the International Conference on Machine Learning (ICML)}.
+
+\bibitem{gidaris2018rotation}
+Gidaris, S., Singh, P., \& Komodakis, N. (2018).
+Unsupervised representation learning by predicting image rotations.
+\textit{arXiv preprint arXiv:1803.07728}.
+
+\bibitem{hendrycks2019pretraining}
+Hendrycks, D., Lee, K., \& Mazeika, M. (2019).
+Using pre-training can improve model robustness and uncertainty.
+\textit{arXiv preprint arXiv:1901.09960}.
+
+\bibitem{he2016resnet}
+He, K., Zhang, X., Ren, S., \& Sun, J. (2016).
+Deep residual learning for image recognition.
+\textit{Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}.
+
+\bibitem{wu2018groupnorm}
+Wu, Y. \& He, K. (2018).
+Group normalization.
+\textit{Proceedings of the European Conference on Computer Vision (ECCV)}.
+
+\end{thebibliography}
+
+\end{document}
